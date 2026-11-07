@@ -32,6 +32,60 @@ static void save_token(void) {
     fprintf(f, "%s\n", token);
     fclose(f);
 }
+/*
+ * LAN-only mode (no plex.tv, no internet).
+ *
+ * If <data>/plex_lan.conf exists, EVO talks straight to that one Plex Media
+ * Server on the local network and never contacts plex.tv:
+ *
+ *     line 1: server address, e.g.  http://192.168.1.50:32400
+ *     line 2: the server's X-Plex-Token
+ *
+ * Plain http:// is accepted only for this exact, user-configured address.
+ */
+static char lan_uri[512];
+static char lan_token[1024];
+
+static void plex_lan_trim(char *s) {
+    s[strcspn(s, "\r\n")] = 0;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '/'))
+        s[--n] = 0;
+    char *b = s;
+    while (*b == ' ' || *b == '\t') ++b;
+    if (b != s) memmove(s, b, strlen(b) + 1);
+}
+
+static void plex_lan_load(void) {
+    lan_uri[0] = lan_token[0] = 0;
+    FILE *f = fopen(evo_data_path("plex_lan.conf"), "r");
+    if (!f) return;
+    if (fgets(lan_uri, sizeof lan_uri, f)) plex_lan_trim(lan_uri);
+    if (fgets(lan_token, sizeof lan_token, f)) plex_lan_trim(lan_token);
+    fclose(f);
+    if (strncmp(lan_uri, "http://", 7) != 0 &&
+        strncmp(lan_uri, "https://", 8) != 0) {
+        EVO_LOGW("plex", "lan: plex_lan.conf line 1 is not an http(s) URL, ignored");
+        lan_uri[0] = 0;
+    }
+    if (lan_uri[0] && !lan_token[0])
+        EVO_LOGW("plex", "lan: plex_lan.conf has no token on line 2");
+    EVO_LOGI("plex", "lan: mode=%d token=%d", lan_uri[0] != 0, lan_token[0] != 0);
+}
+
+static int plex_lan_mode(void) { return lan_uri[0] != 0 && lan_token[0] != 0; }
+
+/* https:// anywhere, or exactly the configured LAN server address. */
+static int plex_uri_allowed(const char *uri) {
+    if (!uri) return 0;
+    if (strncmp(uri, "https://", 8) == 0) return 1;
+    if (!plex_lan_mode()) return 0;
+    size_t n = strlen(lan_uri);
+    return strncmp(uri, lan_uri, n) == 0 && (uri[n] == 0 || uri[n] == '/');
+}
+
+static void plex_lan_install_server(void);
+
 static int plex_init(void) {
     FILE *f = fopen(evo_data_path("plex.conf"), "r");
     token[0] = 0;
@@ -40,11 +94,14 @@ static int plex_init(void) {
             token[strcspn(token, "\r\n")] = 0;
         fclose(f);
     }
+    plex_lan_load();
+    if (plex_lan_mode())
+        plex_lan_install_server();
     return 0;
 }
 static void plex_shutdown(void) { pending = 0; }
-static int plex_configured(void) { return token[0] != 0; }
-static int plex_signed_in(void) { return token[0] != 0; }
+static int plex_configured(void) { return token[0] != 0 || plex_lan_mode(); }
+static int plex_signed_in(void) { return token[0] != 0 || plex_lan_mode(); }
 static int plex_needs_sign_in(void) { return !plex_signed_in(); }
 static void plex_sign_out(void) { token[0] = 0; save_token(); pending = 0; }
 
@@ -130,6 +187,10 @@ static int plex_qc_poll(evo_provider_qc_cb cb, void *ud) {
 static void plex_qc_cancel(void) { pending = 0; pin_id = 0; }
 static int plex_auth(evo_provider_auth_cb cb, void *ud) {
     if (!cb) return -1;
+    if (plex_lan_mode()) {
+        cb(1, "Plex LAN server (offline mode)", ud);
+        return 0;
+    }
     cb(plex_signed_in(), plex_signed_in() ? "Plex account linked" : "Sign in using Plex link code", ud);
     return 0;
 }
@@ -149,6 +210,16 @@ typedef struct {
 
 static plex_server_t plex_servers[PLEX_SERVER_MAX];
 static int plex_server_count;
+
+/* LAN mode: the one configured server is server 0, known from boot. */
+static void plex_lan_install_server(void) {
+    memset(plex_servers, 0, sizeof plex_servers);
+    snprintf(plex_servers[0].id, sizeof plex_servers[0].id, "lan");
+    snprintf(plex_servers[0].uri, sizeof plex_servers[0].uri, "%s", lan_uri);
+    snprintf(plex_servers[0].access_token,
+             sizeof plex_servers[0].access_token, "%s", lan_token);
+    plex_server_count = 1;
+}
 
 typedef struct {
     evo_provider_items_cb cb;
@@ -528,7 +599,7 @@ static void plex_set_media_artwork(evo_provider_item_t *it,
 
     const char *base = plex_servers[server_index].uri;
 
-    if (!base[0] || strncmp(base, "https://", 8) != 0)
+    if (!base[0] || !plex_uri_allowed(base))
         return;
 
     if (thumb && thumb[0] == '/') {
@@ -1124,6 +1195,22 @@ static int plex_list_catalog(const char *parent_id, int page,
         return 0;
     }
 
+    if (plex_lan_mode()) {
+        plex_lan_install_server();
+
+        evo_provider_item_t item;
+        evo_provider_item_clear(&item);
+        snprintf(item.id, sizeof item.id, "srv:%s", plex_servers[0].id);
+        snprintf(item.title, sizeof item.title, "Plex Media Server");
+        snprintf(item.subtitle, sizeof item.subtitle, "LAN (offline mode)");
+        item.kind = EVO_MEDIA_FOLDER;
+        item.is_folder = 1;
+
+        EVO_LOGI("plex", "catalog: LAN mode, skipping plex.tv discovery");
+        cb(1, &item, 1, 0, ud);
+        return 0;
+    }
+
     plex_catalog_ctx_t *ctx =
         (plex_catalog_ctx_t *)calloc(1, sizeof *ctx);
 
@@ -1175,7 +1262,7 @@ int evo_plex_art_auth_header(const char *url, char *out, size_t cap)
         const plex_server_t *server = &plex_servers[i];
         const char *base = server->uri;
 
-        if (strncmp(base, "https://", 8) != 0)
+        if (!plex_uri_allowed(base))
             continue;
 
         size_t n = strlen(base);
@@ -1295,7 +1382,7 @@ static int plex_resolve_xml(const char *body, size_t len,
 
     plex_server_t *server = &plex_servers[server_index];
 
-    if (strncmp(server->uri, "https://", 8) != 0 ||
+    if (!plex_uri_allowed(server->uri) ||
         !server->access_token[0])
         return 0;
 
